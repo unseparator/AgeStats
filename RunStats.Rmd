@@ -1,0 +1,239 @@
+---
+title: "AOE_stats"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(jsonlite)
+library(httr)
+library(ggplot2)
+library(RColorBrewer)
+library(ggrepel)
+library(remotes)
+
+```
+
+## 
+```{r player id}
+
+####################Enter your ID here. !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+#the players ID and id type - INPUTS
+IDtype = "profile_id"
+
+#enter your profile ID number here. Can be found in the URL of your profile on AOE2.net
+IDnum = "485890"
+
+
+```
+
+```{r API import, echo=FALSE}
+
+#call from the AOE2 API
+res = GET("https://aoe2.net/api/player/matches?game=aoe2de&profile_id=485890&count=500")
+data = fromJSON(rawToChar(res$content))
+```
+
+## 
+
+```{r, echo=FALSE}
+
+#compile a list of civilisations and maps
+strings <- GET("https://aoe2.net/api/strings")
+strings <- fromJSON(rawToChar(strings$content))
+civs <- strings$civ
+maps <- strings$map_type
+
+civ_role <- read.csv("CivRoles.csv")
+
+```
+
+
+```{r simple win rate, echo=FALSE}
+
+
+##the history frame
+pf <- as.tibble(data)
+pf <- pf %>% filter(name == "AUTOMATCH") %>% select(match_id,map_type,started,finished,server,players) %>% unnest()
+
+#generate the player's history by filtering for their ID number
+my_hist <- pf  %>% filter(profile_id == IDnum) %>% filter(!is.na(won))
+my_hist$won <- my_hist$won %>% as.numeric() #this converts from bool to num for easier processing
+
+pre_hist <- my_hist
+
+############ CIVILISATION ADJUSTMENT #################
+##the civs are numbered alphabetically. The release of the Lords of the West
+##disrupted this. I believe the numbers in the list reflect original civ numbers
+##the numbers need to be adjusted
+
+#if the match started before Jan 26, shift the civ numbers
+
+civ_adj <- function(x,started){
+  if(started<1613986882){
+    if(x > 3){
+      x = x + 1
+      if(x > 28){
+        x = x + 1
+      }else {x=x}
+    
+    }else {x=x}
+  }
+  else {x=x}
+}
+
+my_hist$civ <- mapply(civ_adj,x=my_hist$civ,started=my_hist$started)
+
+
+
+#calculate the win % by civilisation
+wins <- my_hist %>% group_by(civ) %>% summarise(mean = mean(won))
+wins_temp <- my_hist %>% group_by(civ) %>% summarise(win = sum(won))
+wins <- left_join(civs, wins, by = c("id"="civ"))
+wins <- left_join(wins_temp, wins, by = c("civ"="id"))
+wins <- wins %>% mutate(loss = win/mean) %>% 
+
+#calculate the number of times I have played with a civ
+civs_cnt <- my_hist %>% group_by(civ) %>% count()
+civs_cnt <- left_join(civs, civs_cnt, by = c("id"="civ"))
+
+
+my_hist <- merge(x=civ_role,y=my_hist, by.x = "Civ_idx", by.y = "civ" )%>% rename(civ_name = Civ) %>% rename(civ = Civ_idx)
+
+civ_type_names <- list("Archer","Cavalry","Infantry","Cavalry Archer","Siege","Meso-American")
+
+
+
+Type_wins <- tibble(
+
+  my_hist %>% filter(Archer==1) %>% summarise("Archer" = mean(won)) ,
+  my_hist %>% filter(Cavalry==1) %>% summarise("Cavalry" = mean(won)),
+  my_hist %>% filter(Infantry==1) %>% summarise("Infantry" = mean(won)),
+  my_hist %>% filter(CA.Civ==1) %>% summarise("Cavalry Archer" = mean(won)),
+  my_hist %>% filter(Siege==1) %>% summarise("Siege" = mean(won)),
+  my_hist %>% filter(Meso==1) %>% summarise("Meso-American" = mean(won))
+) %>% gather() %>% rename(WR = value)
+
+
+#pf <- as.tibble(hf[hf$players])
+
+```
+
+
+
+```{r ELO adjusted win rate, echo=FALSE}
+
+#exclude ratings of N/A and ensure as numerics
+pft <- pf %>% filter(!is.na(won)) %>% filter(!is.na(rating))
+pft$rating <- pft$rating %>% as.numeric()
+
+#calculate the team-wise average rating (mean)
+team_elo <- pft %>% group_by(match_id,team) %>% summarise(mean = mean(rating))
+
+#my_hist$team1 <- team_elo %>% filter(team == 1) %>% select(mean)
+
+#label opposing team as distinct from my team
+my_hist$opp_team <- lapply(my_hist$team,FUN = f)
+
+#Input 2, get 1. Input 1, get 2.
+f<- function(x) {
+  2/x
+}
+
+#create dummy columns to match up the teams and match IDs
+team_elo$dummy <- paste(team_elo$match_id,team_elo$team)
+my_hist$dummy <- paste(my_hist$match_id,my_hist$team)
+my_hist$dummy2 <- paste(my_hist$match_id,my_hist$opp_team)
+
+
+
+
+########## Output production #########################
+
+
+#merge team ratings sheets with team ratings
+my_hist <-  merge(x=team_elo,y=my_hist, by.x = "dummy", by.y = "dummy") %>% rename(my_team_rating = mean)
+my_hist <-  merge(x=team_elo,y=my_hist, by.x = "dummy", by.y = "dummy2") %>% rename(opp_team_rating = mean)
+
+#calculate win rate
+my_hist <- my_hist %>% mutate(P = 1/(1+10^((opp_team_rating-my_team_rating)/400)))
+
+#outcome likelihood
+my_hist <- my_hist %>% mutate(O = won-P)
+
+#a table of number of plays by win rate
+winnum <-  merge(x=wins,y=civs_cnt, by.x = "string", by.y = "string") 
+
+##calculate over-performance. Over-performance = % won - average likelihood of winning
+OverPerf <- my_hist %>% group_by(civ) %>% summarise(mean = mean(O))
+OverPerf <- left_join(civs, OverPerf, by = c("id"="civ"))
+
+#to compare wins to over_performance.
+ovr_win <- merge(x=wins,y=OverPerf, by.x = "string", by.y = "string") %>% mutate(mean.x = mean.x-0.5) %>% mutate(diff = mean.x-mean.y)
+
+
+
+```
+
+
+```{r civs and wins, echo=FALSE}
+
+colour_anchor <- c("#C1A2F4","#BD9EF0","#B99AEC","#B597E9","#B193E5","#AD90E1","#A98CDE","#A589DA","#A285D6","#9E81D3","#9A7ECF","#967ACB","#9277C8","#8E73C4","#8A70C0","#876CBD","#8368B9","#7F65B5","#7B61B2","#775EAE","#735AAB","#6F57A7","#6B53A3","#684FA0","#644C9C","#604898","#5C4595","#584191","#543E8D","#503A8A","#4D3686","#493382","#452F7F","#412C7B","#3D2877","#392574","#352170","#321E6D")
+small_colour_anchor <- c("#452F7F","#412C7B","#3D2877","#392574","#352170","#321E6D")
+
+#percentage played histogram
+civ_chr <- 
+  ggplot(civs_cnt,aes(x=string,y=n, fill=string)) +
+  geom_col() + 
+  theme_bw() + 
+  theme(panel.background = element_blank(), legend.position="none", axis.text.x = element_text(angle = 90,vjust = 0.5)) + 
+  ylab("Games played as civ") + xlab("Civilisation") 
+
+
+#percentage won
+win_chr <- 
+  ggplot(wins,aes(x=string,y=mean, fill=string))+
+  geom_col() + 
+  theme_bw() + 
+  theme(panel.background = element_blank(), legend.position="none", axis.text.x = element_text(angle = 90,vjust = 0.5)) + 
+  scale_y_continuous(labels = scales::percent) +ylab("Win percentage") + xlab("Civilisation")
+ 
+#overperformance metric
+ovr_chr <- 
+  ggplot(OverPerf,aes(x=string,y=mean, fill=string))+
+  geom_col() + 
+  theme_bw() + 
+  theme(panel.background = element_blank(), legend.position="none", axis.text.x = element_text(angle = 90,vjust = 0.5)) + 
+  scale_y_continuous(labels = scales::percent) +ylab("Relative over-performance") + xlab("Civilisation")
+
+
+play_v_win <- 
+  ggplot(winnum,aes(x=n, y=mean,label=(string))) + 
+  geom_point(shape=19,size=3,color="#321E6D")+
+  geom_text_repel(size=3) +
+  theme_bw() +
+  ylab("Win percentage") +
+  xlab("Games played") +
+  scale_y_continuous(labels = scales::percent)
+
+ type_wins_chr <-
+  ggplot(Type_wins,aes(x=key,y=WR, fill=key, as.factor(small_colour_anchor)))+
+  geom_col() +
+  theme_bw() + 
+  theme(panel.background = element_blank(), legend.position="none", axis.text.x = element_text(angle = 0,vjust = 0.5)) + 
+  scale_y_continuous(labels = scales::percent) +ylab("Win percentage") + xlab("Civilisation type")
+
+
+
+
+print(civ_chr+ scale_fill_manual(values = colour_anchor))
+print(win_chr + scale_fill_manual(values = colour_anchor))
+print(ovr_chr + scale_fill_manual(values = colour_anchor))
+print(play_v_win + scale_fill_manual(values = colour_anchor))
+print(type_wins_chr + scale_fill_manual(values = c("#BD9EF0","#9A7ECF","#8368B9","#684FA0","#4D3686","#321E6D")))
+
+```
+
+
